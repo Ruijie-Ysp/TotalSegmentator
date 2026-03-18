@@ -1,0 +1,27 @@
+{
+  "name": "totalsegmentator-viewer",
+  "version": "2.0.0",
+  "description": "TotalSegmentator Web Viewer - 专业医学影像分割查看器",
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm run api\" \"npm run web\"",
+    "start": "concurrently -n api,web -c blue,green \"npm run api\" \"npm run web\"",
+    "start:debug": "concurrently -n api,web -c blue,green \"npm run api:debug\" \"npm run web\"",
+    "api": "python -m uvicorn api.main:app --host 0.0.0.0 --port 28000 --reload",
+    "api:debug": "DEBUG=1 python -m uvicorn api.main:app --host 0.0.0.0 --port 28000 --reload --log-level debug",
+    "api:prod": "python -m uvicorn api.main:app --host 0.0.0.0 --port 28000",
+    "web": "cd web && npm run dev",
+    "web:build": "cd web && npm run build",
+    "web:start": "cd web && npm run start",
+    "install:web": "cd web && npm install",
+    "build": "npm run web:build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "",
+  "license": "Apache-2.0"
+}
+

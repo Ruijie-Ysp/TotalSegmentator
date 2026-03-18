@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         xvfb \
         ca-certificates \
+        fontconfig \
+        fonts-noto-cjk \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "numpy<2.0.0" \
     && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch \

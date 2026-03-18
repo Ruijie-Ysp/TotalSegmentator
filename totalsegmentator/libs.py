@@ -117,46 +117,46 @@ def download_model_with_license_and_unpack(task_name, config_dir):
             os.remove(tempfile)
 
 
-def download_url_and_unpack(url, config_dir):
+def download_url_and_unpack(url, config_dir, retries=3):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
 
-    # Not needed anymore since downloading from github assets (actually results in an error)
-    # if "TOTALSEG_DISABLE_HTTP1" in os.environ and os.environ["TOTALSEG_DISABLE_HTTP1"]:
-    #     print("Disabling HTTP/1.0")
-    # else:
-    #     import http.client
-    #     # helps to solve incomplete read errors
-    #     # https://stackoverflow.com/questions/37816596/restrict-request-to-only-ask-for-http-1-0-to-prevent-chunking-error
-    #     http.client.HTTPConnection._http_vsn = 10
-    #     http.client.HTTPConnection._http_vsn_str = 'HTTP/1.0'
+    tempfile_path = config_dir / "tmp_download_file.zip"
 
-    tempfile = config_dir / "tmp_download_file.zip"
+    for i in range(retries):
+        try:
+            st = time.time()
+            with open(tempfile_path, 'wb') as f:
+                with requests.Session() as s:
+                    with s.get(url, stream=True, timeout=60, headers=headers, allow_redirects=True) as r:
+                        r.raise_for_status()
+                        total_size = int(r.headers.get('content-length', 0))
+                        progress_bar = tqdm(total=total_size, unit='B', unit_scale=True, 
+                                          desc=f"Downloading (Attempt {i+1}/{retries})")
+                        for chunk in r.iter_content(chunk_size=8192 * 32):
+                            if chunk:
+                                progress_bar.update(len(chunk))
+                                f.write(chunk)
+                        progress_bar.close()
 
-    try:
-        st = time.time()
-        with open(tempfile, 'wb') as f:
-            # session = requests.Session()  # making it slower
-
-            with requests.get(url, stream=True) as r:
-                r.raise_for_status()
-
-                # With progress bar
-                total_size = int(r.headers.get('content-length', 0))
-                progress_bar = tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading")
-                for chunk in r.iter_content(chunk_size=8192 * 16):
-                    progress_bar.update(len(chunk))
-                    f.write(chunk)
-                progress_bar.close()
-
-        print("Download finished. Extracting...")
-        # call(['unzip', '-o', '-d', network_training_output_dir, tempfile])
-        with zipfile.ZipFile(config_dir / "tmp_download_file.zip", 'r') as zip_f:
-            zip_f.extractall(config_dir)
-        # print(f"  downloaded in {time.time()-st:.2f}s")
-    except Exception as e:
-        raise e
-    finally:
-        if tempfile.exists():
-            os.remove(tempfile)
+            print("Download finished. Extracting...")
+            with zipfile.ZipFile(tempfile_path, 'r') as zip_f:
+                zip_f.extractall(config_dir)
+            
+            if tempfile_path.exists():
+                os.remove(tempfile_path)
+            return # Success
+            
+        except Exception as e:
+            if tempfile_path.exists():
+                os.remove(tempfile_path)
+            if i < retries - 1:
+                print(f"Download failed: {e}. Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                print(f"Download failed after {retries} attempts.")
+                raise e
 
 
 def download_pretrained_weights(task_id):
@@ -193,6 +193,7 @@ def download_pretrained_weights(task_id):
     # url = "http://backend.totalsegmentator.com"
     url = "https://github.com/wasserth/TotalSegmentator/releases/download"
 
+    WEIGHTS_URL = ""
     if task_id == 291:
         weights_path = config_dir / "Dataset291_TotalSegmentator_part1_organs_1559subj"
         # WEIGHTS_URL = "https://zenodo.org/record/6802342/files/Task251_TotalSegmentator_part1_organs_1139subj.zip?download=1"
@@ -413,6 +414,10 @@ def download_pretrained_weights(task_id):
             #     print(config_dir)
             # delete tmp file
             # (config_dir / "tmp_download_file.zip").unlink()
+
+            if WEIGHTS_URL == "":
+                print(f"ERROR: No weights URL found for task {task_id}. This task might not be supported yet or requires a commercial license.")
+                return
 
             download_url_and_unpack(WEIGHTS_URL, config_dir)
 

@@ -1,0 +1,96 @@
+services:
+  # PostgreSQL - 任务元数据存储
+  postgres:
+    image: postgres:15-alpine
+    container_name: totalseg_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-totalseg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-totalseg_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-totalseg}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-totalseg}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MinIO - 对象存储（CT/分割文件）
+  minio:
+    image: minio/minio:latest
+    container_name: totalseg_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # Redis - 缓存和任务队列（启用 AOF 持久化）
+  redis:
+    image: redis:7-alpine
+    container_name: totalseg_redis
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Label Studio - 数据标注平台（可选）
+  label-studio:
+    image: heartexlabs/label-studio:latest
+    container_name: totalseg_labelstudio
+    ports:
+      - "${LABEL_STUDIO_PORT:-10080}:8080"
+    environment:
+      LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED: "true"
+      LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT: /label-studio/data
+      # S3/MinIO 存储配置
+      LABEL_STUDIO_FEATURE_FLAGS_ENABLE_CLOUD_STORAGE: "true"
+      # 允许跨域访问
+      LABEL_STUDIO_CROSS_ORIGIN_RESOURCE_POLICY: "cross-origin"
+      # ML Backend 连接配置
+      ML_BACKEND_URL: http://host.docker.internal:28000/ml
+    volumes:
+      - labelstudio_data:/label-studio/data
+    depends_on:
+      - postgres
+      - minio
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles:
+      - labelstudio  # 使用 --profile labelstudio 启用
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local
+  labelstudio_data:
+    driver: local
+
+networks:
+  default:
+    name: totalseg_network
+

@@ -1,0 +1,13 @@
+{
+  "selection_state": {
+    "diagnostic_analysis": {
+      "enabled": true,
+      "priority": true
+    },
+    "comprehensive_report": {
+      "enabled": true,
+      "priority": true
+    }
+  },
+  "custom_templates": {}
+}

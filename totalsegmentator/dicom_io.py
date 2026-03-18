@@ -212,6 +212,10 @@ def dcm_to_nifti(input_path, output_path, tmp_dir=None, verbose=False):
             input_path = extract_dir
 
     # Convert to nifti
+    # Add support for skipping missing slices
+    if os.environ.get("DICOM2NIFTI_ALLOW_MISSING_SLICES") == "True":
+        dicom2nifti.settings.disable_validate_slice_increment()
+    
     dicom2nifti.dicom_series_to_nifti(input_path, output_path, reorient_nifti=True)
 
 
