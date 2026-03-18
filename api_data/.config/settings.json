@@ -1,0 +1,16 @@
+{
+  "llm": {
+    "enabled": true,
+    "provider": "openai",
+    "api_key": "sk-acf36977a4de4aaa8193caada5b93839",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3-vl-plus",
+    "temperature": 0.7,
+    "max_tokens": 1024,
+    "timeout": 300,
+    "system_prompt": "你是一位专业的医学影像分析专家。根据提供的 CT 影像信息，生成专业、准确的医学描述。\n请使用中文回答，语言要专业但易于理解。",
+    "qa_prompt_template": "基于以下 CT 切片信息生成专业的医学问答：\n\n切片信息：\n- 轴向：{axis}\n- 切片位置：{slice_idx}/{total_slices}\n- 检测到的器官：{organs}\n- 器官中文名：{organs_cn}\n\n请生成 {num_qa} 个高质量的问答对，格式如下：\nQ: [问题]\nA: [详细专业的回答]\n\n问答类型包括：器官识别、位置描述、形态分析、临床意义等。"
+  },
+  "session_persist": true,
+  "auto_save_interval": 60
+}
