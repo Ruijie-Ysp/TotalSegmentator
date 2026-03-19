@@ -1,0 +1,11 @@
+# Docker Compose Override for Mac (no GPU)
+# This file automatically overrides docker-compose.yml on Mac
+
+services:
+  api:
+    # Remove GPU requirement for Mac
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
