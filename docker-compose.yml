@@ -54,6 +54,87 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # FastAPI Backend - 分割服务（GPU 算力侧）
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: totalseg-api:latest
+    container_name: totalseg_api
+    command: python -m uvicorn api.main:app --host 0.0.0.0 --port 28000
+    environment:
+      USE_DATABASE: ${USE_DATABASE:-true}
+      DEBUG: ${DEBUG:-false}
+      SEGMENTATION_WORKER_COUNT: ${SEGMENTATION_WORKER_COUNT:-1}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-totalseg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-totalseg_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-totalseg}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-totalseg-data}
+      MINIO_SECURE: "false"
+      MINIO_PUBLIC_URL: http://minio:9000
+    ports:
+      - "${API_PORT:-28000}:28000"
+    volumes:
+      - ./api_data:/app/api_data
+      - ./outputs:/app/outputs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:28000/api/health', timeout=5)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-all}
+              capabilities: [gpu]
+
+  # Next.js Frontend - 平台子模块前端
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:28000}
+    image: totalseg-web:latest
+    container_name: totalseg_web
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:28000}
+      HOSTNAME: 0.0.0.0
+      PORT: 23000
+    ports:
+      - "${WEB_PORT:-23000}:23000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:23000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
   # Label Studio - 数据标注平台（可选）
   label-studio:
     image: heartexlabs/label-studio:latest
@@ -68,15 +149,17 @@ services:
       # 允许跨域访问
       LABEL_STUDIO_CROSS_ORIGIN_RESOURCE_POLICY: "cross-origin"
       # ML Backend 连接配置
-      ML_BACKEND_URL: http://host.docker.internal:28000/ml
+      ML_BACKEND_URL: http://api:28000/ml
     volumes:
       - labelstudio_data:/label-studio/data
     depends_on:
-      - postgres
-      - minio
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      api:
+        condition: service_healthy
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     profiles:
       - labelstudio  # 使用 --profile labelstudio 启用
 
@@ -93,4 +176,3 @@ volumes:
 networks:
   default:
     name: totalseg_network
-
