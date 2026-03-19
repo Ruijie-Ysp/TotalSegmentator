@@ -2,7 +2,8 @@
 FROM python:3.11-slim
 
 ENV PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TOTALSEG_HOME_DIR=/root/.totalsegmentator
 
 WORKDIR /app
 
@@ -28,7 +29,15 @@ RUN echo "force rebuild from here (2)"
 # Copy application and install
 COPY . /app
 RUN pip install --no-cache-dir /app \
-    && python /app/totalsegmentator/download_pretrained_weights.py \
+    && pip install --no-cache-dir -r /app/api/requirements.txt \
+    && mkdir -p /root/.totalsegmentator \
+    && if [ -d /app/.totalsegmentator/nnunet/results ]; then \
+        echo "Using local TotalSegmentator weights from /app/.totalsegmentator"; \
+        cp -a /app/.totalsegmentator/. /root/.totalsegmentator/; \
+      else \
+        echo "Local weights not found in build context, fallback to online download"; \
+        python /app/totalsegmentator/download_pretrained_weights.py; \
+      fi \
     && find /usr/local/lib/python3.11 -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
     && find /usr/local/lib/python3.11 -type f -name "*.pyc" -delete \
     && find /usr/local/lib/python3.11 -type f -name "*.pyo" -delete

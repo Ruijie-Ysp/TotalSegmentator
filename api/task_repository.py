@@ -201,7 +201,7 @@ class TaskRepository:
         async with get_db_session() as session:
             result = await session.execute(
                 select(Task)
-                .where(Task.status.in_(["uploading", "processing"]))
+                .where(Task.status.in_(["queued", "uploading", "processing"]))
                 .order_by(desc(Task.created_at))
             )
             return [task.to_dict() for task in result.scalars().all()]

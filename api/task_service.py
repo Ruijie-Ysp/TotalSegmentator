@@ -261,6 +261,7 @@ class TaskService:
         stats = {
             "total": len(self.sessions),
             "completed": 0,
+            "queued": 0,
             "processing": 0,
             "uploaded": 0,
             "error": 0,
@@ -305,4 +306,3 @@ def get_task_service(sessions: Dict[str, Any], data_dir: Path) -> TaskService:
     if _task_service is None:
         _task_service = TaskService(sessions, data_dir)
     return _task_service
-

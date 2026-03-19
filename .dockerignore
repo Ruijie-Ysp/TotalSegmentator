@@ -1,8 +1,13 @@
-# ** is any number of nested directories
-# **/*.model
-# db/models/*
-# db/test_data/*
-# db/log.txt
-# db/api_keys.txt
-# db/server_config.txt
-# tmp_weights
+.git
+.gitignore
+.github
+.pytest_cache
+.ruff_cache
+.vscode
+.next
+node_modules
+web/node_modules
+api_data
+outputs
+tests
+tmp_weights

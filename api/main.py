@@ -23,8 +23,9 @@ os.environ["DICOM2NIFTI_ALLOW_MISSING_SLICES"] = "True"  # 设置 DICOM 缺失�
 import tempfile
 import shutil
 import zipfile
+import asyncio
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Literal
+from typing import Optional, List, Dict, Any, Tuple, Literal, Set
 import json
 import hashlib
 import gc
@@ -91,11 +92,13 @@ async def lifespan(app):
     except Exception as e:
         print(f"⚠ Redis 初始化失败: {e}")
 
+    await _start_segmentation_workers()
     print("✓ 服务初始化完成")
 
     yield
 
     # 关闭时清理
+    await _stop_segmentation_workers()
     print("👋 服务正在关闭...")
 
 app = FastAPI(
@@ -171,6 +174,10 @@ def _get_env_int(name: str, default: int) -> int:
 
 MAX_RUNTIME_CACHE_SESSIONS = max(0, _get_env_int("MAX_RUNTIME_CACHE_SESSIONS", 1))
 UPLOAD_READ_CHUNK_BYTES = max(256 * 1024, _get_env_int("UPLOAD_READ_CHUNK_BYTES", 4 * 1024 * 1024))
+SEGMENTATION_WORKER_COUNT = max(1, _get_env_int("SEGMENTATION_WORKER_COUNT", 1))
+SEGMENTATION_QUEUE: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+SEGMENTATION_QUEUED_SESSION_IDS: Set[str] = set()
+SEGMENTATION_WORKER_TASKS: List[asyncio.Task] = []
 
 # 任务服务（兼容旧代码）
 from api.task_service import TaskService, get_task_service
@@ -276,6 +283,85 @@ async def _save_session(session_id: str, session: Dict[str, Any]) -> None:
             _disable_database_mode("update_task failed", e)
 
     save_single_session(session_id, data_to_save)
+
+
+def _get_queue_position(session_id: str) -> Optional[int]:
+    """返回任务在队列中的位置（从 1 开始），不存在返回 None"""
+    try:
+        queue_items = list(getattr(SEGMENTATION_QUEUE, "_queue", []))
+        for idx, item in enumerate(queue_items, start=1):
+            if item.get("session_id") == session_id:
+                return idx
+    except Exception:
+        return None
+    return None
+
+
+async def _enqueue_segmentation_job(session_id: str, request: "SegmentRequest") -> int:
+    """将分割任务加入后台队列，返回排队位置"""
+    payload = {
+        "session_id": session_id,
+        "request": request.model_dump(),
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await SEGMENTATION_QUEUE.put(payload)
+    SEGMENTATION_QUEUED_SESSION_IDS.add(session_id)
+    return _get_queue_position(session_id) or SEGMENTATION_QUEUE.qsize()
+
+
+async def _segmentation_worker_loop(worker_id: int) -> None:
+    """后台分割 worker：串行/并行消费任务队列"""
+    print(f"✓ 分割 Worker-{worker_id} 已启动")
+    while True:
+        try:
+            job = await SEGMENTATION_QUEUE.get()
+        except asyncio.CancelledError:
+            print(f"👋 分割 Worker-{worker_id} 已停止")
+            break
+
+        session_id = str(job.get("session_id", ""))
+        request_data = job.get("request") or {}
+
+        try:
+            request = SegmentRequest(**request_data)
+            await _run_segmentation_pipeline(session_id, request)
+        except Exception as e:
+            print(f"⚠ Worker-{worker_id} 处理任务失败 {session_id}: {e}")
+        finally:
+            SEGMENTATION_QUEUED_SESSION_IDS.discard(session_id)
+            SEGMENTATION_QUEUE.task_done()
+
+
+async def _start_segmentation_workers() -> None:
+    """启动分割后台 worker"""
+    global SEGMENTATION_WORKER_TASKS
+
+    if SEGMENTATION_WORKER_TASKS:
+        return
+
+    SEGMENTATION_WORKER_TASKS = [
+        asyncio.create_task(
+            _segmentation_worker_loop(i + 1),
+            name=f"segmentation-worker-{i + 1}",
+        )
+        for i in range(SEGMENTATION_WORKER_COUNT)
+    ]
+    print(f"✓ 分割任务队列已启动，worker 数量: {SEGMENTATION_WORKER_COUNT}")
+
+
+async def _stop_segmentation_workers() -> None:
+    """停止分割后台 worker"""
+    global SEGMENTATION_WORKER_TASKS
+
+    if not SEGMENTATION_WORKER_TASKS:
+        return
+
+    for task in SEGMENTATION_WORKER_TASKS:
+        task.cancel()
+
+    await asyncio.gather(*SEGMENTATION_WORKER_TASKS, return_exceptions=True)
+    SEGMENTATION_WORKER_TASKS = []
+    print("✓ 分割任务队列已停止")
 
 
 async def _delete_session(session_id: str) -> bool:
@@ -933,6 +1019,7 @@ class SegmentRequest(BaseModel):
     fast: bool = True
     device: str = "auto"  # auto, gpu, cpu, mps
     debug_mode: bool = False  # 调试模式：保留临时文件
+    additional_tasks: List[str] = []  # 附加任务，如 ["liver_lesions", "lung_vessels"]
 
 
 class SliceRequest(BaseModel):
@@ -1164,16 +1251,12 @@ async def upload_file(file: UploadFile = File(...)):
     }
 
 
-@app.post("/api/segment/{session_id}")
-async def run_segmentation(session_id: str, request: SegmentRequest):
-    """
-    运行分割任务
-    支持: NIfTI, DICOM, ZIP (含多 Series 智能选择), 2D 图像
-    """
-    # 使用辅助函数检查并获取会话
+async def _run_segmentation_pipeline(session_id: str, request: SegmentRequest) -> None:
+    """后台执行分割流水线（由任务队列 worker 调用）"""
     session = await _get_session(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        print(f"⚠ 分割任务会话不存在，跳过: {session_id}")
+        return
 
     # 确保内存中有会话引用
     SESSIONS[session_id] = session
@@ -1183,12 +1266,16 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
 
     try:
         session["status"] = "processing"
-        session["progress"] = 0
-        session["progress_message"] = "准备处理..."
+        session["progress"] = 5
+        session["progress_message"] = "任务已开始，正在准备数据..."
+        session["task"] = request.task
+        session.pop("error", None)
+        session.pop("queue_position", None)
         file_type = session.get("file_type", "unknown")
         input_path = Path(session["input_path"])
         current_input = str(input_path)
         nifti_input_path = session_dir / "input_converted.nii.gz"
+        await _save_session(session_id, session)
 
         # === 处理 2D 图像 ===
         if file_type == "2d_image":
@@ -1251,35 +1338,114 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
         # 更新进度：准备运行分割
         session["progress"] = 20
         session["progress_message"] = f"准备在 {device} 上运行分割..."
+        await _save_session(session_id, session)
 
-        print(f"Running task {request.task} on {device}...")
+        # 准备所有任务列表
+        all_tasks = [request.task] + (request.additional_tasks or [])
+        print(f"Running tasks {all_tasks} on {device}...")
+        
+        # 验证任务有效性
+        invalid_tasks = [t for t in all_tasks if t not in class_map]
+        if invalid_tasks:
+            raise ValueError(f"无效的任务类型: {invalid_tasks}")
 
         # 更新进度：开始分割
         session["progress"] = 30
-        session["progress_message"] = "正在运行 TotalSegmentator 分割模型..."
+        task_count = len(all_tasks)
+        session["progress_message"] = f"正在运行分割模型 (0/{task_count})..."
+        await _save_session(session_id, session)
 
-        # === 运行 TotalSegmentator ===
-        result = await run_in_threadpool(
-            totalsegmentator,
-            input=current_input,
-            output=str(output_path),
-            task=request.task,
-            fast=request.fast,
-            device=device,
-            ml=True,
-        )
+        # === 运行多个 TotalSegmentator 任务 ===
+        task_results = {}  # 存储每个任务的结果
+        base_affine = None  # 用于确保所有结果使用相同的 affine
+        base_shape = None
+        
+        for idx, task_name in enumerate(all_tasks):
+            progress_start = 30 + (idx * 40 // task_count)
+            progress_end = 30 + ((idx + 1) * 40 // task_count)
+            
+            session["progress"] = progress_start
+            session["progress_message"] = f"正在运行分割模型 ({idx+1}/{task_count}): {task_name}..."
+            await _save_session(session_id, session)
+            
+            task_output_path = session_dir / f"segmentation_{task_name}.nii.gz"
+            
+            print(f"  [{idx+1}/{task_count}] Running task: {task_name}")
+            result = await run_in_threadpool(
+                totalsegmentator,
+                input=current_input,
+                output=str(task_output_path),
+                task=task_name,
+                fast=request.fast,
+                device=device,
+                ml=True,
+            )
+            
+            if isinstance(result, tuple):
+                result_img = result[0]
+            else:
+                result_img = result
+            
+            # 保存每个任务的独立结果
+            nib.save(result_img, str(task_output_path))
+            
+            # 读取分割数据
+            seg_data = np.asarray(result_img.dataobj)
+            task_results[task_name] = seg_data
+            
+            # 记录基础 affine 和 shape
+            if base_affine is None:
+                base_affine = result_img.affine
+                base_shape = seg_data.shape
+        
+        # === 合并所有分割结果 ===
+        session["progress"] = 70
+        session["progress_message"] = "正在合并分割结果..."
+        await _save_session(session_id, session)
+        
+        # 创建合并的分割图像
+        combined_seg = np.zeros(base_shape, dtype=np.uint16)
+        combined_organs = {}  # 合并后的器官映射
+        current_label = 1
+        
+        # 主任务使用原始标签
+        main_task = request.task
+        if main_task in task_results:
+            main_seg = task_results[main_task]
+            main_class_map = class_map.get(main_task, {})
+            # 直接使用原始标签
+            for label_id, organ_name in main_class_map.items():
+                if label_id > 0:
+                    mask = main_seg == label_id
+                    combined_seg[mask] = label_id
+                    combined_organs[label_id] = organ_name
+            current_label = max(main_class_map.keys()) + 1 if main_class_map else 1
+        
+        # 附加任务使用新的连续标签
+        for task_name in (request.additional_tasks or []):
+            if task_name in task_results:
+                task_seg = task_results[task_name]
+                task_class_map = class_map.get(task_name, {})
+                
+                for label_id, organ_name in task_class_map.items():
+                    if label_id > 0:
+                        mask = task_seg == label_id
+                        if np.any(mask):  # 只添加有实际分割结果的器官
+                            combined_seg[mask] = current_label
+                            combined_organs[current_label] = f"{task_name}:{organ_name}"
+                            current_label += 1
+        
+        # 保存合并后的结果到主输出文件
+        combined_img = nib.Nifti1Image(combined_seg, base_affine)
+        nib.save(combined_img, str(output_path))
+        
+        # 使用合并后的数据
+        seg_data = combined_seg
 
         # 更新进度：分割完成，处理结果
         session["progress"] = 80
-        session["progress_message"] = "分割完成，正在处理结果..."
-
-        if isinstance(result, tuple):
-            result_img = result[0]
-        else:
-            result_img = result
-
-        # 保存分割结果
-        nib.save(result_img, str(output_path))
+        session["progress_message"] = f"分割完成，共 {len(combined_organs)} 个器官，正在处理结果..."
+        await _save_session(session_id, session)
 
         # 用 dataobj 保持原始 dtype，避免 get_fdata() 默认 float64 造成内存翻倍
         seg_data = np.asarray(result_img.dataobj)
@@ -1329,15 +1495,17 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
 
         # 更新进度：完成
         session["progress"] = 100
-        session["progress_message"] = "处理完成！"
-
+        session["progress_message"] = f"处理完成！共分割 {len(combined_organs)} 个结构"
         session.update({
             "status": "completed",
             "task": request.task,
+            "additional_tasks": request.additional_tasks or [],
+            "all_tasks": all_tasks,
             "output_path": str(output_path),
             "shape": list(seg_data.shape),
-            "organs": list(class_map.get(request.task, {}).values()),
-            "processed_input": current_input
+            "organs": combined_organs,  # 使用合并后的器官映射
+            "processed_input": current_input,
+            "organ_count": len(combined_organs)
         })
 
         # 缓存数据用于切片提取（不保存到文件，运行时缓存）
@@ -1347,9 +1515,6 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
         session["_seg_img"] = None
         _touch_session(session)
         _prune_runtime_session_cache()
-
-        # 持久化保存（使用辅助函数，自动选择数据库或文件模式）
-        await _save_session(session_id, session)
 
         # 调试模式：保留临时文件和生成报告
         debug_info = None
@@ -1366,18 +1531,9 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
                     _dicom_series_summary(zip_extract_dir, summary_path)
                     debug_info = {"debug_dir": str(debug_out_dir), "summary": str(summary_path)}
 
-            session["debug_info"] = debug_info
-
-        return {
-            "session_id": session_id,
-            "status": "completed",
-            "shape": session["shape"],
-            "organ_count": len(session["organs"]),
-            "organs": session["organs"],
-            "file_type": file_type,
-            "device_used": device,
-            "debug_info": debug_info
-        }
+        session["debug_info"] = debug_info
+        await _save_session(session_id, session)
+        print(f"✓ 分割任务完成: {session_id}")
 
     except Exception as e:
         import traceback
@@ -1417,7 +1573,70 @@ async def run_segmentation(session_id: str, request: SegmentRequest):
             except Exception as debug_e:
                 print(f"Debug save failed: {debug_e}")
 
-        raise HTTPException(status_code=500, detail=str(e))
+        await _save_session(session_id, session)
+
+
+@app.post("/api/segment/{session_id}")
+async def run_segmentation(session_id: str, request: SegmentRequest):
+    """
+    提交分割任务（异步执行）
+    支持: NIfTI, DICOM, ZIP (含多 Series 智能选择), 2D 图像
+    """
+    session = await _get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # 已在处理中则直接返回当前状态（幂等）
+    current_status = session.get("status")
+    if current_status == "processing":
+        return {
+            "session_id": session_id,
+            "status": "processing",
+            "message": "任务正在处理中",
+            "progress": session.get("progress", 0),
+            "progress_message": session.get("progress_message", ""),
+        }
+
+    if current_status == "queued":
+        queue_position = _get_queue_position(session_id)
+        if queue_position is not None or session_id in SEGMENTATION_QUEUED_SESSION_IDS:
+            return {
+                "session_id": session_id,
+                "status": "queued",
+                "message": "任务已在队列中",
+                "queue_position": queue_position,
+                "queue_size": SEGMENTATION_QUEUE.qsize(),
+            }
+
+    # 重新提交任务时清理旧的运行时缓存
+    _release_runtime_arrays(session)
+    session.pop("error", None)
+    session.pop("error_message", None)
+    session.pop("debug_info", None)
+    session.pop("output_path", None)
+    session.pop("shape", None)
+    session.pop("organs", None)
+    session.pop("processed_input", None)
+
+    session["status"] = "queued"
+    session["progress"] = 0
+    session["task"] = request.task
+    session["progress_message"] = "任务已入队，等待可用 GPU..."
+    session["requested_at"] = datetime.now(timezone.utc).isoformat()
+    session["requested_device"] = request.device
+
+    queue_position = await _enqueue_segmentation_job(session_id, request)
+    session["queue_position"] = queue_position
+    session["progress_message"] = f"任务已入队，当前排队第 {queue_position} 位"
+    await _save_session(session_id, session)
+
+    return {
+        "session_id": session_id,
+        "status": "queued",
+        "message": session["progress_message"],
+        "queue_position": queue_position,
+        "queue_size": SEGMENTATION_QUEUE.qsize(),
+    }
 
 
 @app.get("/api/metadata/{session_id}")
@@ -4690,23 +4909,46 @@ async def get_active_task():
     """
     获取当前进行中的任务（用于页面刷新后恢复）
 
-    返回最近一个状态为 'uploading' 或 'processing' 的任务
+    返回最近一个状态为 'queued' / 'uploading' / 'processing' 的任务
     """
-    # 查找进行中的任务
-    active_tasks = []
-    for session_id, session in SESSIONS.items():
-        status = session.get("status", "unknown")
-        if status in ("uploading", "processing"):
-            active_tasks.append({
-                "session_id": session_id,
-                "filename": session.get("filename", "unknown"),
-                "file_type": session.get("file_type"),
-                "status": status,
-                "task_type": session.get("task", "total"),
-                "created_at": session.get("created_at"),
-                "progress": session.get("progress", 0),  # 进度百分比
-                "progress_message": session.get("progress_message", ""),
-            })
+    active_statuses = {"queued", "uploading", "processing"}
+    active_tasks: List[Dict[str, Any]] = []
+
+    # 数据库模式优先从 DB 查询，避免依赖当前进程内存
+    if _database_mode_enabled():
+        try:
+            db_tasks = await TaskRepository.get_active_tasks()
+            for task in db_tasks:
+                status = task.get("status", "unknown")
+                if status in active_statuses:
+                    active_tasks.append({
+                        "session_id": task.get("session_id"),
+                        "filename": task.get("filename", "unknown"),
+                        "file_type": task.get("file_type"),
+                        "status": status,
+                        "task_type": task.get("task", task.get("task_type", "total")),
+                        "created_at": task.get("created_at"),
+                        "progress": task.get("progress", 0),
+                        "progress_message": task.get("progress_message", ""),
+                    })
+        except Exception as e:
+            _disable_database_mode("get_active_task failed", e)
+
+    # 回退或兼容模式：从内存读取
+    if not active_tasks:
+        for session_id, session in SESSIONS.items():
+            status = session.get("status", "unknown")
+            if status in active_statuses:
+                active_tasks.append({
+                    "session_id": session_id,
+                    "filename": session.get("filename", "unknown"),
+                    "file_type": session.get("file_type"),
+                    "status": status,
+                    "task_type": session.get("task", "total"),
+                    "created_at": session.get("created_at"),
+                    "progress": session.get("progress", 0),  # 进度百分比
+                    "progress_message": session.get("progress_message", ""),
+                })
 
     if not active_tasks:
         return {"active_task": None}
@@ -4747,6 +4989,10 @@ async def get_task_status(session_id: str):
     # 如果出错，返回错误信息
     if status == "error":
         result["error_message"] = session.get("error", "未知错误")
+
+    if status == "queued":
+        result["queue_position"] = _get_queue_position(session_id)
+        result["queue_size"] = SEGMENTATION_QUEUE.qsize()
 
     return result
 
