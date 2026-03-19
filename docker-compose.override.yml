@@ -1,11 +1,20 @@
-# Docker Compose Override for Mac (no GPU)
+# Docker Compose Override for Apple Silicon Mac (M1/M2/M3)
 # This file automatically overrides docker-compose.yml on Mac
 
 services:
   api:
-    # Remove GPU requirement for Mac
+    # Use Apple Silicon optimized Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile.apple-silicon
+    # Remove GPU requirement, use CPU with MPS fallback
     deploy:
       resources:
         limits:
-          cpus: '4'
-          memory: 8G
+          cpus: '6'
+          memory: 12G
+    environment:
+      # Enable MPS (Metal Performance Shaders) fallback for PyTorch
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+      - OMP_NUM_THREADS=6
+      - MKL_NUM_THREADS=6

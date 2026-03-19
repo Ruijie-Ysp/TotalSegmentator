@@ -1,0 +1,44 @@
+# Apple Silicon (M1/M2/M3) Optimized Dockerfile
+# Uses ARM64 base image and CPU-optimized PyTorch
+
+FROM python:3.11-slim
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TOTALSEG_HOME_DIR=/root/.totalsegmentator \
+    PYTORCH_ENABLE_MPS_FALLBACK=1
+
+WORKDIR /app
+
+# Install system dependencies for Apple Silicon
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libsm6 \
+        libxext6 \
+        xvfb \
+        ca-certificates \
+        fontconfig \
+        fonts-noto-cjk \
+        libgomp1 \
+    && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir "numpy<2.0.0" \
+    && pip install --no-cache-dir torch torchvision torchaudio \
+    && pip install --no-cache-dir fury \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy application and install
+COPY . /app
+RUN pip install --no-cache-dir /app \
+    && pip install --no-cache-dir -r /app/api/requirements.txt \
+    && mkdir -p /root/.totalsegmentator \
+    && if [ -d /app/.totalsegmentator/nnunet/results ]; then \
+        echo "Using local TotalSegmentator weights from /app/.totalsegmentator"; \
+        cp -a /app/.totalsegmentator/. /root/.totalsegmentator/; \
+      else \
+        echo "Local weights not found in build context, fallback to online download"; \
+        python /app/totalsegmentator/download_pretrained_weights.py; \
+      fi \
+    && find /usr/local/lib/python3.11 -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.11 -type f -name "*.pyc" -delete \
+    && find /usr/local/lib/python3.11 -type f -name "*.pyo" -delete
