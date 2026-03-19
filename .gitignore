@@ -26,3 +26,7 @@ unittest_prediction_fast_force_split.nii.gz
 *.pem
 *.log
 *.ipynb
+# Dependencies
+node_modules/
+**/node_modules/
+web/node_modules/
